@@ -1,0 +1,30 @@
+{
+  "name": "@thinkiac/module-process-bridge",
+  "version": "0.1.0",
+  "main": "index.cjs",
+  "license": "MIT",
+  "scripts": {
+    "build": "node scripts/build.cjs",
+    "prepare": "npm run build",
+    "test": "npm run build && node --test test/*.test.cjs"
+  },
+  "files": [
+    "index.cjs",
+    "src",
+    "dist",
+    "scripts",
+    "README.md",
+    "docs",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ThinkIac/process-bridge.git"
+  },
+  "devDependencies": {
+    "logostype": "git+https://github.com/ThinkIac/LogosType.git#acdcc6032ab94219e0d4a4d25b1538fb55fa19cf"
+  }
+}

@@ -1,0 +1,142 @@
+{spawn: defaultSpawn} = require 'node:child_process'
+readline = require 'node:readline'
+RUNTIME_BIN = Object.freeze
+  python: ['python3'], python3: ['python3'], node: ['node']
+  deno: ['deno', 'run', '--allow-all'], ruby: ['ruby'], bun: ['bun'], rust: []
+DEFAULT_TIMEOUT_MS = 30000
+DEFAULT_BACKOFF_MS = 500
+MAX_BACKOFF_MS = 30000
+
+# JSONL bridge owned by the package host. No new registration semantics.
+class ProcessBridge
+  constructor: (options = {}) ->
+    unless options.name and options.runtime and options.main
+      throw new TypeError 'name, runtime and main are required'
+    @name = options.name
+    @runtime = options.runtime
+    @main = options.main
+    @cwd = options.cwd or process.cwd()
+    @timeoutMs = options.timeoutMs or DEFAULT_TIMEOUT_MS
+    @spawn = options.spawn or defaultSpawn
+    @onRegister = options.onRegister or ->
+    @onEmit = options.onEmit or ->
+    @onLog = options.onLog or ->
+    @onError = options.onError or ->
+    @onExit = options.onExit
+    @child = null
+    @pending = new Map()
+    @nextId = 1
+    @backoff = DEFAULT_BACKOFF_MS
+    @stopped = false
+    @restartTimer = null
+
+  start: ->
+    return false if @stopped
+    bin = RUNTIME_BIN[@runtime]
+    unless bin
+      @onError new Error "unsupported runtime \"#{@runtime}\""
+      return false
+    [command, baseArgs...] = bin
+    executable = if @runtime is 'rust' then @main else command
+    args = if @runtime is 'rust' then baseArgs else [...baseArgs, @main]
+    try
+      @child = @spawn executable, args, {cwd: @cwd, stdio: ['pipe', 'pipe', 'pipe']}
+    catch error
+      @onError error
+      @scheduleRestart {code: null, signal: null}
+      return false
+    child = @child
+    if child.stdout
+      readline.createInterface(input: child.stdout).on 'line', (line) => @onLine line
+    child.stderr?.on 'data', (data) => @onLog String(data), 'stderr'
+    child.on 'error', (error) => @onError error
+    child.on 'close', (code, signal) =>
+      return unless @child is child
+      @child = null
+      @rejectAll "process exited with code #{code}"
+      @scheduleRestart {code, signal} unless @stopped
+      return
+    @onLog "started (#{@runtime} #{@main}, pid #{child.pid})", 'lifecycle'
+    true
+
+  scheduleRestart: (exit) ->
+    handled = false
+    try
+      handled = @onExit?(exit) is true
+    catch error
+      @onError error
+    return if handled or @stopped
+    wait = @backoff
+    @backoff = Math.min @backoff * 2, MAX_BACKOFF_MS
+    @onLog "exited (#{exit.code}) — restarting in #{wait}ms", 'lifecycle'
+    @restartTimer = setTimeout (=>
+      @restartTimer = null
+      @start()
+      return
+    ), wait
+    @restartTimer.unref?()
+    return
+
+  onLine: (line) ->
+    try
+      message = JSON.parse line
+    catch
+      return
+    switch message.op
+      when 'result'
+        pending = @pending.get message.id
+        if pending
+          clearTimeout pending.timer
+          @pending.delete message.id
+          pending.resolve message.payload
+        @backoff = DEFAULT_BACKOFF_MS
+      when 'error'
+        pending = @pending.get message.id
+        if pending
+          clearTimeout pending.timer
+          @pending.delete message.id
+          pending.reject new Error message.message or 'process error'
+      when 'register' then @onRegister(if Array.isArray(message.events) then message.events else [])
+      when 'emit' then @onEmit message.event, message.payload
+      when 'log' then @onLog String(message.message or ''), 'process'
+    return
+
+  call: (event, payload) ->
+    unless @child?.stdin?.writable
+      return Promise.reject new Error "[proc] module \"#{@name}\" is not running"
+    id = String @nextId++
+    new Promise (resolve, reject) =>
+      timer = setTimeout (=>
+        @pending.delete id
+        reject new Error "[proc] \"#{@name}\" timed out on \"#{event}\" (#{@timeoutMs}ms)"
+      ), @timeoutMs
+      @pending.set id, {resolve, reject, timer}
+      try
+        @child.stdin.write "#{JSON.stringify {op: 'event', id, event, payload}}\n"
+      catch error
+        clearTimeout timer
+        @pending.delete id
+        reject error
+      return
+
+  rejectAll: (reason) ->
+    for pending from @pending.values()
+      clearTimeout pending.timer
+      pending.reject new Error "[proc] #{@name}: #{reason}"
+    @pending.clear()
+    return
+
+  stop: ->
+    @stopped = true
+    clearTimeout @restartTimer if @restartTimer
+    @restartTimer = null
+    @rejectAll 'bridge stopped'
+    @child?.kill()
+    @child = null
+    return
+
+Object.defineProperty ProcessBridge.prototype, 'pid',
+  get: -> @child?.pid
+  configurable: true
+
+module.exports = {ProcessBridge, RUNTIME_BIN, DEFAULT_TIMEOUT_MS, DEFAULT_BACKOFF_MS, MAX_BACKOFF_MS}
